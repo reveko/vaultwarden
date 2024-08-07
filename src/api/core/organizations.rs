@@ -844,7 +844,8 @@ struct InviteData {
     groups: Vec<String>,
     r#type: NumberOrString,
     collections: Option<Vec<CollectionData>>,
-    access_all: Option<bool>,
+    #[serde(default)]
+    access_all: bool,
 }
 
 #[post("/organizations/<org_id>/users/invite", data = "<data>")]
@@ -896,7 +897,7 @@ async fn send_invite(org_id: &str, data: Json<InviteData>, headers: AdminHeaders
         };
 
         let mut new_user = UserOrganization::new(user.uuid.clone(), String::from(org_id));
-        let access_all = data.access_all.unwrap_or(false);
+        let access_all = data.access_all;
         new_user.access_all = access_all;
         new_user.atype = new_type;
         new_user.status = user_org_status;
@@ -997,14 +998,6 @@ async fn reinvite_user(org_id: &str, user_org: &str, headers: AdminHeaders, mut 
 }
 
 async fn _reinvite_user(org_id: &str, user_org: &str, invited_by_email: &str, conn: &mut DbConn) -> EmptyResult {
-    if !CONFIG.invitations_allowed() {
-        err!("Invitations are not allowed.")
-    }
-
-    if !CONFIG.mail_enabled() {
-        err!("SMTP is not configured.")
-    }
-
     let user_org = match UserOrganization::find_by_uuid(user_org, conn).await {
         Some(user_org) => user_org,
         None => err!("The user hasn't been invited to the organization."),
@@ -1018,6 +1011,10 @@ async fn _reinvite_user(org_id: &str, user_org: &str, invited_by_email: &str, co
         Some(user) => user,
         None => err!("User not found."),
     };
+
+    if !CONFIG.invitations_allowed() && user.password_hash.is_empty() {
+        err!("Invitations are not allowed.")
+    }
 
     let org_name = match Organization::find_by_uuid(org_id, conn).await {
         Some(org) => org.name,
@@ -1034,9 +1031,14 @@ async fn _reinvite_user(org_id: &str, user_org: &str, invited_by_email: &str, co
             Some(invited_by_email.to_string()),
         )
         .await?;
-    } else {
+    } else if user.password_hash.is_empty() {
         let invitation = Invitation::new(&user.email);
         invitation.save(conn).await?;
+    } else {
+        let _ = Invitation::take(&user.email, conn).await;
+        let mut user_org = user_org;
+        user_org.status = UserOrgStatus::Accepted as i32;
+        user_org.save(conn).await?;
     }
 
     Ok(())
@@ -1296,6 +1298,7 @@ struct EditUserData {
     r#type: NumberOrString,
     collections: Option<Vec<CollectionData>>,
     groups: Option<Vec<String>>,
+    #[serde(default)]
     access_all: bool,
 }
 
@@ -2222,7 +2225,8 @@ async fn get_groups(org_id: &str, _headers: ManagerHeadersLoose, mut conn: DbCon
 #[serde(rename_all = "camelCase")]
 struct GroupRequest {
     name: String,
-    access_all: Option<bool>,
+    #[serde(default)]
+    access_all: bool,
     external_id: Option<String>,
     collections: Vec<SelectionReadOnly>,
     users: Vec<String>,
@@ -2230,17 +2234,12 @@ struct GroupRequest {
 
 impl GroupRequest {
     pub fn to_group(&self, organizations_uuid: &str) -> Group {
-        Group::new(
-            String::from(organizations_uuid),
-            self.name.clone(),
-            self.access_all.unwrap_or(false),
-            self.external_id.clone(),
-        )
+        Group::new(String::from(organizations_uuid), self.name.clone(), self.access_all, self.external_id.clone())
     }
 
     pub fn update_group(&self, mut group: Group) -> Group {
         group.name.clone_from(&self.name);
-        group.access_all = self.access_all.unwrap_or(false);
+        group.access_all = self.access_all;
         // Group Updates do not support changing the external_id
         // These input fields are in a disabled state, and can only be updated/added via ldap_import
 
