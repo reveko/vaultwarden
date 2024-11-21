@@ -120,16 +120,8 @@ async fn _refresh_login(data: ConnectData, conn: &mut DbConn) -> JsonResult {
         "expires_in": expires_in,
         "token_type": "Bearer",
         "refresh_token": device.refresh_token,
-        "Key": user.akey,
-        "PrivateKey": user.private_key,
 
-        "Kdf": user.client_kdf_type,
-        "KdfIterations": user.client_kdf_iter,
-        "KdfMemory": user.client_kdf_memory,
-        "KdfParallelism": user.client_kdf_parallelism,
-        "ResetMasterPassword": false, // TODO: according to official server seems something like: user.password_hash.is_empty(), but would need testing
         "scope": scope,
-        "unofficialServer": true,
     });
 
     Ok(Json(result))
@@ -173,22 +165,42 @@ async fn _password_login(
     // Set the user_uuid here to be passed back used for event logging.
     *user_uuid = Some(user.uuid.clone());
 
-    // Check password
-    let password = data.password.as_ref().unwrap();
-    if let Some(auth_request_uuid) = data.auth_request.clone() {
-        if let Some(auth_request) = AuthRequest::find_by_uuid(auth_request_uuid.as_str(), conn).await {
-            if !auth_request.check_access_code(password) {
-                err!(
-                    "Username or access code is incorrect. Try again",
-                    format!("IP: {}. Username: {}.", ip.ip, username),
-                    ErrorEvent {
-                        event: EventType::UserFailedLogIn,
-                    }
-                )
+    // Check if the user is disabled
+    if !user.enabled {
+        err!(
+            "This user has been disabled",
+            format!("IP: {}. Username: {}.", ip.ip, username),
+            ErrorEvent {
+                event: EventType::UserFailedLogIn
             }
-        } else {
+        )
+    }
+
+    let password = data.password.as_ref().unwrap();
+
+    // If we get an auth request, we don't check the user's password, but the access code of the auth request
+    if let Some(ref auth_request_uuid) = data.auth_request {
+        let Some(auth_request) = AuthRequest::find_by_uuid(auth_request_uuid.as_str(), conn).await else {
             err!(
                 "Auth request not found. Try again.",
+                format!("IP: {}. Username: {}.", ip.ip, username),
+                ErrorEvent {
+                    event: EventType::UserFailedLogIn,
+                }
+            )
+        };
+
+        let expiration_time = auth_request.creation_date + chrono::Duration::minutes(5);
+        let request_expired = Utc::now().naive_utc() >= expiration_time;
+
+        if auth_request.user_uuid != user.uuid
+            || !auth_request.approved.unwrap_or(false)
+            || request_expired
+            || ip.ip.to_string() != auth_request.request_ip
+            || !auth_request.check_access_code(password)
+        {
+            err!(
+                "Username or access code is incorrect. Try again",
                 format!("IP: {}. Username: {}.", ip.ip, username),
                 ErrorEvent {
                     event: EventType::UserFailedLogIn,
@@ -205,25 +217,14 @@ async fn _password_login(
         )
     }
 
-    // Change the KDF Iterations
-    if user.password_iterations != CONFIG.password_iterations() {
+    // Change the KDF Iterations (only when not logging in with an auth request)
+    if data.auth_request.is_none() && user.password_iterations != CONFIG.password_iterations() {
         user.password_iterations = CONFIG.password_iterations();
         user.set_password(password, None, false, None);
 
         if let Err(e) = user.save(conn).await {
             error!("Error updating user: {:#?}", e);
         }
-    }
-
-    // Check if the user is disabled
-    if !user.enabled {
-        err!(
-            "This user has been disabled",
-            format!("IP: {}. Username: {}.", ip.ip, username),
-            ErrorEvent {
-                event: EventType::UserFailedLogIn
-            }
-        )
     }
 
     let now = Utc::now().naive_utc();
@@ -342,7 +343,6 @@ async fn _password_login(
         "MasterPasswordPolicy": master_password_policy,
 
         "scope": scope,
-        "unofficialServer": true,
         "UserDecryptionOptions": {
             "HasMasterPassword": !user.password_hash.is_empty(),
             "Object": "userDecryptionOptions"
@@ -461,9 +461,8 @@ async fn _user_api_key_login(
         "KdfIterations": user.client_kdf_iter,
         "KdfMemory": user.client_kdf_memory,
         "KdfParallelism": user.client_kdf_parallelism,
-        "ResetMasterPassword": false, // TODO: Same as above
+        "ResetMasterPassword": false, // TODO: according to official server seems something like: user.password_hash.is_empty(), but would need testing
         "scope": "api",
-        "unofficialServer": true,
     });
 
     Ok(Json(result))
@@ -495,7 +494,6 @@ async fn _organization_api_key_login(data: ConnectData, conn: &mut DbConn, ip: &
         "expires_in": 3600,
         "token_type": "Bearer",
         "scope": "api.organization",
-        "unofficialServer": true,
     })))
 }
 

@@ -161,7 +161,6 @@ impl Organization {
             "identifier": null, // not supported by us
             "name": self.name,
             "seats": null,
-            "maxAutoscaleSeats": null,
             "maxCollections": null,
             "maxStorageGb": i16::MAX, // The value doesn't matter, we don't check server-side
             "use2fa": true,
@@ -231,6 +230,14 @@ impl UserOrganization {
             return true;
         }
         false
+    }
+
+    /// Return the status of the user in an unrevoked state
+    pub fn get_unrevoked_status(&self) -> i32 {
+        if self.status <= UserOrgStatus::Revoked as i32 {
+            return self.status + ACTIVATE_REVOKE_DIFF;
+        }
+        self.status
     }
 
     pub fn set_external_id(&mut self, external_id: Option<String>) -> bool {
@@ -374,7 +381,6 @@ impl UserOrganization {
             "identifier": null, // Not supported
             "name": org.name,
             "seats": null,
-            "maxAutoscaleSeats": null,
             "maxCollections": null,
             "usersGetPremium": true,
             "use2fa": true,
@@ -411,7 +417,7 @@ impl UserOrganization {
             "familySponsorshipValidUntil": null,
             "familySponsorshipToDelete": null,
             "accessSecretsManager": false,
-            "limitCollectionCreationDeletion": true,
+            "limitCollectionCreationDeletion": false, // This should be set to true only when we can handle roles like createNewCollections
             "allowAdminAccessToAllCollectionItems": true,
             "flexibleCollections": false,
 
@@ -456,7 +462,13 @@ impl UserOrganization {
             Vec::with_capacity(0)
         };
 
-        let collections: Vec<Value> = if include_collections {
+        // Check if a user is in a group which has access to all collections
+        // If that is the case, we should not return individual collections!
+        let full_access_group =
+            CONFIG.org_groups_enabled() && Group::is_in_full_access_group(&self.user_uuid, &self.org_uuid, conn).await;
+
+        // If collections are to be included, only include them if the user does not have full access via a group or defined to the user it self
+        let collections: Vec<Value> = if include_collections && !(full_access_group || self.has_full_access()) {
             // Get all collections for the user here already to prevent more queries
             let cu: HashMap<String, CollectionUser> =
                 CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
@@ -477,7 +489,7 @@ impl UserOrganization {
                 .into_iter()
                 .filter_map(|c| {
                     let (read_only, hide_passwords, can_manage) = if self.has_full_access() {
-                        (false, false, self.atype == UserOrgType::Manager)
+                        (false, false, self.atype >= UserOrgType::Manager)
                     } else if let Some(cu) = cu.get(&c.uuid) {
                         (
                             cu.read_only,
@@ -526,7 +538,7 @@ impl UserOrganization {
         json!({
             "id": self.uuid,
             "userId": self.user_uuid,
-            "name": user.name,
+            "name": if self.get_unrevoked_status() >= UserOrgStatus::Accepted as i32 { Some(user.name) } else { None },
             "email": user.email,
             "externalId": self.external_id,
             "avatarColor": user.avatar_color,
